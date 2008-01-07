@@ -1,6 +1,6 @@
 require 'spec'
 $:.push File.join(File.dirname(__FILE__), '..', 'lib')
-require 'do'
+require 'data_objects'
 
 adapter = (ENV["ADAPTER"] || "sqlite3").dup
 
