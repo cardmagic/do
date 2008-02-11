@@ -1,22 +1,20 @@
 require 'spec'
-$:.push File.join(File.dirname(__FILE__), '..', 'lib')
-require 'data_objects'
 
 adapter = (ENV["ADAPTER"] || "sqlite3").dup
 
-require "do_#{adapter}"
+require File.dirname(__FILE__) + "/../lib/data_objects"
+require File.dirname(__FILE__) + "/../../do_#{adapter}/lib/do_#{adapter}"
 
-adapter_module = adapter.dup
-adapter_module[0] = adapter_module[0].chr.upcase
-$adapter_module = DataObject.const_get(adapter_module)
+adapter_module = adapter.dup.capitalize
+$adapter_module = DataObjects.const_get(adapter_module)
 
-$connection_string = case adapter
+$uri = case adapter
 when "sqlite3"
-  "dbname=do_rb"
+  "sqlite3://do_rb.db"
 when "mysql"
-  "socket=/tmp/mysql.sock user=root dbname=do_rb"
+  "mysql://root@localhost/do_rb//tmp/mysql.sock"
 when "postgres"
-  "dbname=do_rb"
+  "postgres://localhost/do_rb"
 end
 
 $escape          = $adapter_module::QUOTE_COLUMN
