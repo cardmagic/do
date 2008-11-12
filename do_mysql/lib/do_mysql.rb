@@ -1,28 +1,50 @@
+require 'mysql_c'
 require 'data_objects'
-require 'rbmysql'
 
-module DataObjects
+module DataObject
   module Mysql
+    TYPES = Hash[*Mysql_c.constants.select {|x| x.include?("MYSQL_TYPE")}.map {|x| [Mysql_c.const_get(x), x.gsub(/^MYSQL_TYPE_/, "")]}.flatten]    
+    
     QUOTE_STRING = "\""
     QUOTE_COLUMN = "`"
     
-    class Connection < DataObjects::Connection
+    class Connection < DataObject::Connection
       
-      protected
+      attr_reader :db
       
-      def initialize(uri)
-        scheme, user_info, host, port, registry, path, opaque, query, fragment = URI.split(uri)
-        user, password = user_info.split(':')
-        
-        @mysql_connection = RbMysql::Connection.new(host, user, password || '', path[1..-1], port || 3306, @socket, @flags || 0)
-        raise ConnectionFailed, "Unable to connect to database with provided connection string." unless @mysql_connection
+      def initialize(connection_string)        
+        @state = STATE_CLOSED
+        @connection_string = connection_string
+        opts = connection_string.split(" ")
+        opts.each do |opt|
+          k, v = opt.split("=")
+          raise ArgumentError, "you specified an invalid connection component: #{opt}" unless k && v
+          instance_variable_set("@#{k}", v)
+        end
       end
       
-      public
+      def change_database(database_name)
+        @dbname = database_name
+        @connection_string.gsub(/db_name=[^ ]*/, "db_name=#{database_name}")
+      end
       
-      # Responsible for closing the underlying RbMysql::Connection
-      def real_close
-        @mysql_connection.close
+      def open
+        @db = Mysql_c.mysql_init(nil)
+        raise ConnectionFailed, "could not allocate a MySQL connection" unless @db
+        conn = Mysql_c.mysql_real_connect(@db, @host, @user, @password, @dbname, @port || 0, @socket, @flags || 0)
+        raise ConnectionFailed, "Unable to connect to database with provided connection string. \n#{Mysql_c.mysql_error(@db)}" unless conn
+        @state = STATE_OPEN
+        true
+      end
+      
+      def close
+        if @state == STATE_OPEN
+          Mysql_c.mysql_close(@db)
+          @state = STATE_CLOSED        
+          true
+        else
+          false
+        end
       end
       
       def create_command(text)
@@ -33,19 +55,19 @@ module DataObjects
         Transaction.new(self)
       end
       
-      def execute_reader(sql)
-        mysql_reader = @mysql_connection.execute_reader(sql)
-        raise StandardError, "Your query failed.\n#{@mysql_connection.last_error}\n#{@sql}" unless mysql_reader
-        Reader.new(mysql_reader)
-      end
-
-      def execute_non_query(sql)
-        @mysql_connection.execute_non_query(sql)
-      end
-
     end
     
-    class Transaction < DataObjects::Transaction
+    class Field
+      attr_reader :name, :type
+      
+      def initialize(ptr)
+        @name, @type = ptr.name.to_s, ptr.type.to_s
+      end
+    end
+
+    class Transaction
+
+      attr_reader :connection
 
       def initialize(conn)
         @connection = conn
@@ -75,48 +97,147 @@ module DataObjects
       protected
 
       def exec_sql(sql)
-        # @connection.logger.debug(sql)
-        @connection.mysql_reader.execute_non_reader(sql)
+        @connection.logger.debug(sql)
+        Mysql_c.mysql_query(@connection.db, sql)
       end
 
     end
     
-    class Command < DataObjects::Command
+    class Reader < DataObject::Reader
+      
+      def initialize(db, reader)        
+        @reader = reader
+        unless @reader
+          if Mysql_c.mysql_field_count(db) == 0
+            @records_affected = Mysql_c.mysql_affected_rows(db)
+            close
+          else
+            raise UnknownError, "An unknown error has occured while trying to process a MySQL query.\n#{Mysql_c.mysql_error(db)}"
+          end
+        else
+          @field_count = @reader.field_count
+          @state = STATE_OPEN
+          
+          @native_fields, @fields = Mysql_c.mysql_c_fetch_field_types(@reader, @field_count), Mysql_c.mysql_c_fetch_field_names(@reader, @field_count)
+
+          raise UnknownError, "An unknown error has occured while trying to process a MySQL query. There were no fields in the resultset\n#{Mysql_c.mysql_error(db)}" if @native_fields.empty?
+          
+          @has_rows = !(@row = Mysql_c.mysql_c_fetch_row(@reader)).nil?
+        end
+      end
+      
+      def close
+        if @state == STATE_OPEN
+          Mysql_c.mysql_free_result(@reader)
+          @state = STATE_CLOSED
+          true
+        else
+          false
+        end
+      end
+      
+      def name(col)
+        super
+        @fields[col]
+      end
+      
+      def get_index(name)
+        super
+        @fields.index(name)
+      end
+      
+      def null?(idx)
+        super
+        @row[idx] == nil
+      end
+      
+      def current_row
+        @row
+      end
+      
+      def item(idx)
+        super
+        typecast(@row[idx], idx)
+      end
+      
+      def next
+        super
+        @row = Mysql_c.mysql_c_fetch_row(@reader)
+        close if @row.nil?
+        @row ? true : nil
+      end      
+      
+      def each
+        return unless has_rows?
+        
+        while(true) do
+          yield
+          break unless self.next
+        end
+      end
+      
+      protected
+      def native_type(col)
+        super
+        TYPES[@native_fields[col].type]
+      end
+      
+      def typecast(val, idx)
+        return nil if val.nil? || val == "NULL"
+        field = @native_fields[idx]
+        case TYPES[field]
+          when "NULL"
+            nil
+          when "TINY"
+            val != "0"
+          when "BIT"
+            val.to_i(2)
+          when "SHORT", "LONG", "INT24", "LONGLONG"
+            val == '' ? nil : val.to_i
+          when "DECIMAL", "NEWDECIMAL", "FLOAT", "DOUBLE", "YEAR"
+            val.to_f
+          when "TIMESTAMP", "DATETIME"
+            DateTime.parse(val) rescue nil
+          when "TIME"
+            DateTime.parse(val).to_time rescue nil
+          when "DATE"
+            Date.parse(val) rescue nil
+          else
+            val
+        end
+      end      
+    end
+    
+    class Command < DataObject::Command
       
       def execute_reader(*args)
+        super
         sql = escape_sql(args)
-        # @connection.logger.debug { sql }
-        reader = @connection.execute_reader(sql)
-        # reader.set_types @field_types
-
+        @connection.logger.debug { sql }
+        result = Mysql_c.mysql_query(@connection.db, sql)
+        # TODO: Real Error
+        raise QueryError, "Your query failed.\n#{Mysql_c.mysql_error(@connection.db)}\n#{@text}" unless result == 0
+        reader = Reader.new(@connection.db, Mysql_c.mysql_use_result(@connection.db))
         if block_given?
           result = yield(reader)
           reader.close
           result
         else
           reader
-        end        
+        end
       end
-      
-      # def set_types(type_array)
-      #   @field_types = type_array
-      # end
       
       def execute_non_query(*args)
         super
         sql = escape_sql(args)
-        # @connection.logger.debug { sql }
-        result = @connection.execute_non_reader(sql)
-        raise QueryError, "Your query failed.\n#{@connection.last_error}\n#{@text}" unless result
-        rows_affected = result.affected_rows
-        return DataObjects::Result.new(@connection, rows_affected, result.inserted_id)
-      end
-      
-      private
-      
-      def escape_sql(*args)
-        query = args.shift
-        @text
+        @connection.logger.debug { sql }
+        result = Mysql_c.mysql_query(@connection.db, sql)
+        raise QueryError, "Your query failed.\n#{Mysql_c.mysql_error(@connection.db)}\n#{@text}" unless result == 0         
+        reader = Mysql_c.mysql_store_result(@connection.db)
+        raise QueryError, "You called execute_non_query on a query: #{@text}" if reader
+        rows_affected = Mysql_c.mysql_affected_rows(@connection.db)
+        Mysql_c.mysql_free_result(reader)
+        return ResultData.new(@connection, rows_affected, Mysql_c.mysql_insert_id(@connection.db))
       end
       
       def quote_time(value)
@@ -131,67 +252,6 @@ module DataObjects
       def quote_date(value)
         "DATE('#{value.strftime("%Y-%m-%d")}')"
       end
-        
-    end
-    
-    class Reader < DataObjects::Reader
-      
-      def initialize(mysql_reader)
-        @mysql_reader = mysql_reader
-
-        unless @mysql_reader
-          if mysql_reader.field_count == 0
-            @records_affected = mysql_reader.affected_rows
-            close
-          else
-            raise UnknownError, "An unknown error has occured while trying to process a MySQL query.\n#{@mysql_reader.connection.last_error}"
-          end
-        else
-          @field_count = @mysql_reader.field_count
-
-          # Reads the first row. You shouldn't call #next! until you've used #values first!
-          @current_row = @mysql_reader.fetch_row
-        end
-      end
-      
-      # def set_types(types)
-      #   @mysql_reader.set_types(types)
-      # end
-
-      def fields
-        @mysql_reader.field_names
-      end
-
-      def eof?
-        @current_row.nil?
-      end
-
-      def values
-        @current_row
-      end
-
-      def close
-        @mysql_reader.close
-      end
-
-      # Moves the cursor forward.
-      def next!
-        if @current_row
-          @current_row = @mysql_reader.fetch_row
-          @current_row ? true : nil
-        else
-          nil
-        end
-      end
-      
-      # def each
-      #   return unless has_rows?
-      #   
-      #   while(true) do
-      #     yield
-      #     break unless self.next
-      #   end
-      # end
     end
     
   end
